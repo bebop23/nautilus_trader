@@ -304,10 +304,6 @@ impl InteractiveBrokersDataClient {
         })
     }
 
-    fn venue_id(&self) -> Venue {
-        *IB_VENUE
-    }
-
     fn cancel_active_subscriptions(&self) -> anyhow::Result<()> {
         {
             let mut subscriptions = self
@@ -562,7 +558,12 @@ impl DataClient for InteractiveBrokersDataClient {
     }
 
     fn venue(&self) -> Option<Venue> {
-        Some(self.venue_id())
+        // Interactive Brokers is a multi-venue adapter (SMART, IDEALPRO, ZEROHASH, CME, etc.),
+        // so the data client must register for default routing rather than a single venue:
+        // subscriptions and requests are routed by the command's venue (derived from the
+        // instrument ID), which would otherwise never match and be dropped by the data engine.
+        // Mirrors the other multi-venue adapters (Tardis, Databento).
+        None
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
@@ -2362,6 +2363,23 @@ mod tests {
         let dt = chrono::DateTime::from_timestamp(1, 2).unwrap();
 
         assert_eq!(datetime_to_unix_nanos(dt), UnixNanos::from(1_000_000_002));
+    }
+
+    #[rstest]
+    fn test_venue_is_none_for_default_routing() {
+        // IB is a multi-venue adapter: `venue()` must be `None` so the data engine registers
+        // the client for default routing. A `Some(venue)` here means venue-routed subscribe
+        // commands (e.g. `BTC/USD.ZEROHASH` bars, `AAPL.NASDAQ` quotes) never reach the client.
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        nautilus_common::live::runner::replace_data_event_sender(sender);
+
+        let config = InteractiveBrokersDataClientConfig::default();
+        let provider = Arc::new(InteractiveBrokersInstrumentProvider::new(
+            config.instrument_provider.clone(),
+        ));
+        let client = InteractiveBrokersDataClient::new(*IB_CLIENT_ID, config, provider).unwrap();
+
+        assert_eq!(client.venue(), None);
     }
 
     #[rstest]
