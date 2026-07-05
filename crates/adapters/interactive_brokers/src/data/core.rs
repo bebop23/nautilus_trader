@@ -71,8 +71,8 @@ use super::{
     convert::{
         apply_bar_price_magnifier, apply_price_magnifier, bar_type_to_ib_bar_size,
         calculate_duration, calculate_duration_segments, chrono_to_ib_datetime,
-        ib_bar_to_nautilus_bar, price_type_to_ib_realtime_what_to_show,
-        price_type_to_ib_what_to_show, price_type_to_ib_what_to_show_for_security,
+        ib_bar_to_nautilus_bar, price_type_to_ib_realtime_what_to_show_for_security,
+        price_type_to_ib_what_to_show_for_security,
     },
 };
 use crate::{
@@ -1257,8 +1257,10 @@ impl DataClient for InteractiveBrokersDataClient {
         let use_rth = self.config.use_regular_trading_hours;
         let start_ns = parse_start_ns(cmd.params.as_ref());
         // Crypto (ZEROHASH/PAXOS) trade-price bars must request AGGTRADES, not
-        // TRADES (TWS rejects TRADES for crypto, error 10299). Capture the flag
-        // before `contract` is moved into the subscription task below.
+        // TRADES (TWS rejects TRADES for crypto, error 10299) — on BOTH the
+        // realtime (reqRealTimeBars) and historical (reqHistoricalData) paths, per
+        // the Java engine's whatToShowFor rule. Capture the flag before `contract`
+        // is moved into the subscription task below.
         let is_crypto = matches!(contract.security_type, SecurityType::Crypto);
 
         // Create subscription-specific cancellation token
@@ -1276,7 +1278,10 @@ impl DataClient for InteractiveBrokersDataClient {
                     bar_type,
                     bar_type_str,
                     instrument_id,
-                    price_type_to_ib_realtime_what_to_show(bar_type.spec().price_type),
+                    price_type_to_ib_realtime_what_to_show_for_security(
+                        bar_type.spec().price_type,
+                        is_crypto,
+                    ),
                     price_precision,
                     size_precision,
                     data_sender,

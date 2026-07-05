@@ -232,6 +232,11 @@ pub enum WhatToShow {
     Bid,
     /// Ask prices.
     Ask,
+    /// Aggregated trade data. Required for IB crypto (ZEROHASH): TWS rejects
+    /// `TRADES` for crypto with error 10299 on `reqRealTimeBars`, so crypto
+    /// trade-price 5-second bars must request `AGGTRADES`. (Added by the
+    /// ToTheMoon overlay patch — not in upstream ibapi 3.0.1.)
+    AggTrades,
 }
 
 impl std::fmt::Display for WhatToShow {
@@ -241,6 +246,7 @@ impl std::fmt::Display for WhatToShow {
             Self::MidPoint => write!(f, "MIDPOINT"),
             Self::Bid => write!(f, "BID"),
             Self::Ask => write!(f, "ASK"),
+            Self::AggTrades => write!(f, "AGGTRADES"),
         }
     }
 }
