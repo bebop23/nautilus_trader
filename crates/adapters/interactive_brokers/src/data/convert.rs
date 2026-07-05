@@ -120,6 +120,25 @@ pub fn price_type_to_ib_realtime_what_to_show(price_type: PriceType) -> Realtime
     }
 }
 
+/// Convert Nautilus PriceType to IB WhatToShow for real-time (5-second) bars,
+/// honoring the crypto trade-price special case.
+///
+/// TWS rejects `TRADES` for crypto contracts (ZEROHASH/PAXOS) with error 10299 on
+/// `reqRealTimeBars` too — not just historical. So for a crypto contract requesting
+/// trade-price (`PriceType::Last`), map to [`RealtimeWhatToShow::AggTrades`]. This
+/// mirrors the Java engine, which passes `whatToShowFor(CRYPTO) = "AGGTRADES"`
+/// straight into `subscribeRealTimeBars` (LiveOneMinBarIngestionService).
+#[must_use]
+pub fn price_type_to_ib_realtime_what_to_show_for_security(
+    price_type: PriceType,
+    is_crypto: bool,
+) -> RealtimeWhatToShow {
+    if is_crypto && price_type == PriceType::Last {
+        return RealtimeWhatToShow::AggTrades;
+    }
+    price_type_to_ib_realtime_what_to_show(price_type)
+}
+
 #[must_use]
 pub fn apply_price_magnifier(price: f64, price_magnifier: i32) -> f64 {
     if price_magnifier > 0 {
@@ -481,8 +500,9 @@ mod tests {
     #[rstest]
     fn test_aggtrades_wire_string() {
         // The vendored ibapi patch must serialize AggTrades as the exact IB wire
-        // token "AGGTRADES".
+        // token "AGGTRADES" on BOTH the historical and realtime enums.
         assert_eq!(HistoricalWhatToShow::AggTrades.to_string(), "AGGTRADES");
+        assert_eq!(RealtimeWhatToShow::AggTrades.to_string(), "AGGTRADES");
     }
 
     #[rstest]
@@ -503,6 +523,32 @@ mod tests {
         assert!(matches!(
             price_type_to_ib_realtime_what_to_show(PriceType::Mid),
             RealtimeWhatToShow::MidPoint
+        ));
+    }
+
+    #[rstest]
+    fn test_price_type_to_ib_realtime_what_to_show_for_security_crypto() {
+        // Crypto trade-price (Last) 5-second bars must request AGGTRADES on the
+        // realtime path too — TWS rejects TRADES for crypto (error 10299) on
+        // reqRealTimeBars, exactly as on the historical path. Mirrors the Java
+        // engine passing whatToShowFor(CRYPTO)="AGGTRADES" to subscribeRealTimeBars.
+        assert!(matches!(
+            price_type_to_ib_realtime_what_to_show_for_security(PriceType::Last, true),
+            RealtimeWhatToShow::AggTrades
+        ));
+        // Non-trade price types unaffected by the crypto special case.
+        assert!(matches!(
+            price_type_to_ib_realtime_what_to_show_for_security(PriceType::Mid, true),
+            RealtimeWhatToShow::MidPoint
+        ));
+        assert!(matches!(
+            price_type_to_ib_realtime_what_to_show_for_security(PriceType::Bid, true),
+            RealtimeWhatToShow::Bid
+        ));
+        // Non-crypto trade-price stays TRADES.
+        assert!(matches!(
+            price_type_to_ib_realtime_what_to_show_for_security(PriceType::Last, false),
+            RealtimeWhatToShow::Trades
         ));
     }
 
