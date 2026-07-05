@@ -16,9 +16,12 @@
 //! Conversion utilities for Interactive Brokers data types.
 
 use chrono::{DateTime, Utc};
-use ibapi::market_data::historical::{
-    BarSize as HistoricalBarSize, BarTimestamp, Duration as IBDuration, ToDuration,
-    WhatToShow as HistoricalWhatToShow,
+use ibapi::market_data::{
+    historical::{
+        BarSize as HistoricalBarSize, BarTimestamp, Duration as IBDuration, ToDuration,
+        WhatToShow as HistoricalWhatToShow,
+    },
+    realtime::WhatToShow as RealtimeWhatToShow,
 };
 use nautilus_core::UnixNanos;
 use nautilus_model::{
@@ -82,6 +85,18 @@ pub fn price_type_to_ib_what_to_show(price_type: PriceType) -> HistoricalWhatToS
         PriceType::Ask => HistoricalWhatToShow::Ask,
         PriceType::Mid => HistoricalWhatToShow::MidPoint,
         _ => HistoricalWhatToShow::Trades, // Default to trades
+    }
+}
+
+/// Convert Nautilus PriceType to IB WhatToShow for real-time (5-second) bars.
+#[must_use]
+pub fn price_type_to_ib_realtime_what_to_show(price_type: PriceType) -> RealtimeWhatToShow {
+    match price_type {
+        PriceType::Last => RealtimeWhatToShow::Trades,
+        PriceType::Bid => RealtimeWhatToShow::Bid,
+        PriceType::Ask => RealtimeWhatToShow::Ask,
+        PriceType::Mid => RealtimeWhatToShow::MidPoint,
+        _ => RealtimeWhatToShow::Trades, // Default to trades
     }
 }
 
@@ -400,6 +415,27 @@ mod tests {
             price_type_to_ib_what_to_show(PriceType::Mid),
             HistoricalWhatToShow::MidPoint
         );
+    }
+
+    #[rstest]
+    fn test_price_type_to_ib_realtime_what_to_show() {
+        // `RealtimeWhatToShow` does not derive `PartialEq`, so match on the variants.
+        assert!(matches!(
+            price_type_to_ib_realtime_what_to_show(PriceType::Last),
+            RealtimeWhatToShow::Trades
+        ));
+        assert!(matches!(
+            price_type_to_ib_realtime_what_to_show(PriceType::Bid),
+            RealtimeWhatToShow::Bid
+        ));
+        assert!(matches!(
+            price_type_to_ib_realtime_what_to_show(PriceType::Ask),
+            RealtimeWhatToShow::Ask
+        ));
+        assert!(matches!(
+            price_type_to_ib_realtime_what_to_show(PriceType::Mid),
+            RealtimeWhatToShow::MidPoint
+        ));
     }
 
     #[rstest]
