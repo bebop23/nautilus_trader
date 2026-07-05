@@ -71,7 +71,8 @@ use super::{
     convert::{
         apply_bar_price_magnifier, apply_price_magnifier, bar_type_to_ib_bar_size,
         calculate_duration, calculate_duration_segments, chrono_to_ib_datetime,
-        ib_bar_to_nautilus_bar, price_type_to_ib_what_to_show,
+        ib_bar_to_nautilus_bar, price_type_to_ib_realtime_what_to_show,
+        price_type_to_ib_what_to_show,
     },
 };
 use crate::{
@@ -1271,6 +1272,7 @@ impl DataClient for InteractiveBrokersDataClient {
                     bar_type,
                     bar_type_str,
                     instrument_id,
+                    price_type_to_ib_realtime_what_to_show(bar_type.spec().price_type),
                     price_precision,
                     size_precision,
                     data_sender,
