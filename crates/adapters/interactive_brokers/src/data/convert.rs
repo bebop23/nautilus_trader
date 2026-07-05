@@ -88,6 +88,26 @@ pub fn price_type_to_ib_what_to_show(price_type: PriceType) -> HistoricalWhatToS
     }
 }
 
+/// Convert Nautilus PriceType to IB WhatToShow for historical bars, honoring the
+/// crypto trade-price special case.
+///
+/// IB rejects `TRADES` for crypto contracts (ZEROHASH/PAXOS) with error 10299 —
+/// the venue serves trade-price data only under `AGGTRADES`. So for a crypto
+/// contract requesting trade-price (`PriceType::Last`), map to
+/// [`HistoricalWhatToShow::AggTrades`] instead of [`HistoricalWhatToShow::Trades`].
+/// Non-crypto contracts and non-trade price types are unaffected. This mirrors the
+/// Java engine's `LiveOneMinBarIngestionService.whatToShowFor` rule exactly.
+#[must_use]
+pub fn price_type_to_ib_what_to_show_for_security(
+    price_type: PriceType,
+    is_crypto: bool,
+) -> HistoricalWhatToShow {
+    if is_crypto && price_type == PriceType::Last {
+        return HistoricalWhatToShow::AggTrades;
+    }
+    price_type_to_ib_what_to_show(price_type)
+}
+
 /// Convert Nautilus PriceType to IB WhatToShow for real-time (5-second) bars.
 #[must_use]
 pub fn price_type_to_ib_realtime_what_to_show(price_type: PriceType) -> RealtimeWhatToShow {
@@ -415,6 +435,54 @@ mod tests {
             price_type_to_ib_what_to_show(PriceType::Mid),
             HistoricalWhatToShow::MidPoint
         );
+    }
+
+    #[rstest]
+    fn test_price_type_to_ib_what_to_show_for_security_crypto() {
+        // Crypto trade-price (Last) must map to AGGTRADES, not TRADES — TWS rejects
+        // TRADES for crypto (error 10299). Mirrors the Java whatToShowFor rule.
+        assert_eq!(
+            price_type_to_ib_what_to_show_for_security(PriceType::Last, true),
+            HistoricalWhatToShow::AggTrades
+        );
+        // Non-trade price types are unaffected by the crypto special case.
+        assert_eq!(
+            price_type_to_ib_what_to_show_for_security(PriceType::Bid, true),
+            HistoricalWhatToShow::Bid
+        );
+        assert_eq!(
+            price_type_to_ib_what_to_show_for_security(PriceType::Ask, true),
+            HistoricalWhatToShow::Ask
+        );
+        assert_eq!(
+            price_type_to_ib_what_to_show_for_security(PriceType::Mid, true),
+            HistoricalWhatToShow::MidPoint
+        );
+    }
+
+    #[rstest]
+    fn test_price_type_to_ib_what_to_show_for_security_non_crypto() {
+        // Non-crypto: trade-price stays TRADES (equities/futures), everything else
+        // identical to the plain mapping.
+        assert_eq!(
+            price_type_to_ib_what_to_show_for_security(PriceType::Last, false),
+            HistoricalWhatToShow::Trades
+        );
+        assert_eq!(
+            price_type_to_ib_what_to_show_for_security(PriceType::Bid, false),
+            HistoricalWhatToShow::Bid
+        );
+        assert_eq!(
+            price_type_to_ib_what_to_show_for_security(PriceType::Mid, false),
+            HistoricalWhatToShow::MidPoint
+        );
+    }
+
+    #[rstest]
+    fn test_aggtrades_wire_string() {
+        // The vendored ibapi patch must serialize AggTrades as the exact IB wire
+        // token "AGGTRADES".
+        assert_eq!(HistoricalWhatToShow::AggTrades.to_string(), "AGGTRADES");
     }
 
     #[rstest]
