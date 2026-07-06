@@ -56,6 +56,7 @@ pub(crate) fn raw_ib_account_code(account_id: &AccountId) -> String {
 pub async fn subscribe_account_summary(
     client: &Arc<Client>,
     account_id: AccountId,
+    base_currency: Option<Currency>,
 ) -> anyhow::Result<(Vec<AccountBalance>, Vec<MarginBalance>)> {
     let raw_account_id = raw_ib_account_code(&account_id);
     // Request key account summary tags (includes TotalCashValue to match Python account summary info dict).
@@ -96,7 +97,12 @@ pub async fn subscribe_account_summary(
                 }
 
                 match parse_account_summary_to_balance(&summary) {
-                    Ok(balance) => {
+                    // A non-monetary / summary-only row (e.g. `Cushion`, a ratio) is reported by
+                    // IBKR with an EMPTY currency and carries no balance — skip it rather than
+                    // aborting. Previously an empty-currency row erred here (and IBKR's paper
+                    // account-summary stream includes at least one), which is a benign skip.
+                    Ok(None) => {}
+                    Ok(Some(balance)) => {
                         // Check if balance already exists for this currency
                         if let Some(existing) = balances
                             .iter_mut()
@@ -134,6 +140,26 @@ pub async fn subscribe_account_summary(
         }
     }
 
+    // Seed a base-currency balance if IBKR reported no monetary rows for this account. Without at
+    // least one balance the generated `AccountState` has no balances, so the account never lands in
+    // the cache (`AccountAny::from_events` yields an account the exec engine can't resolve) and every
+    // order/fill/position is rejected with "account not found in cache". IBKR's paper account-summary
+    // can arrive thin (or only the empty-currency `Cushion` row), so guarantee the account is
+    // cacheable by seeding a zero balance in the client's base currency (defaulting to USD).
+    if balances.is_empty() {
+        let currency = base_currency.unwrap_or_else(Currency::USD);
+        tracing::warn!(
+            "Account summary produced no balances for {}; seeding a zero {} balance so the \
+             account resolves into the cache",
+            account_id,
+            currency
+        );
+        match AccountBalance::from_total_and_locked(Decimal::ZERO, Decimal::ZERO, currency) {
+            Ok(balance) => balances.push(balance),
+            Err(e) => tracing::warn!("Failed to seed base-currency balance: {}", e),
+        }
+    }
+
     tracing::info!(
         "Received account summary: {} balances, {} margins",
         balances.len(),
@@ -144,6 +170,11 @@ pub async fn subscribe_account_summary(
 }
 
 fn merge_account_summary_margin(margins: &mut Vec<MarginBalance>, summary: &AccountSummary) {
+    // A non-monetary / summary-only row (empty currency, e.g. `Cushion`) carries no margin — skip
+    // it quietly. Only INIT_MARGIN_REQ / MAINT_MARGIN_REQ rows (which carry a currency) merge below.
+    if summary.currency.is_empty() {
+        return;
+    }
     let currency = match parse_currency(&summary.currency) {
         Ok(currency) => currency,
         Err(e) => {
@@ -499,33 +530,42 @@ pub async fn subscribe_positions(
     Ok(())
 }
 
-/// Parse IB account summary to Nautilus AccountBalance.
-fn parse_account_summary_to_balance(summary: &AccountSummary) -> anyhow::Result<AccountBalance> {
+/// Parse IB account summary to a Nautilus `AccountBalance`.
+///
+/// Returns `Ok(None)` for a non-monetary / summary-only row — one whose currency is empty, such as
+/// the `Cushion` ratio tag. IBKR reports these with an empty `currency` field; they carry no
+/// balance and must be skipped (not treated as a parse failure that could otherwise abort the row).
+fn parse_account_summary_to_balance(
+    summary: &AccountSummary,
+) -> anyhow::Result<Option<AccountBalance>> {
+    // Skip non-monetary rows (empty currency, e.g. the `Cushion` ratio) instead of erroring.
+    if summary.currency.is_empty() {
+        return Ok(None);
+    }
+
     let currency = parse_currency(&summary.currency)?;
     let balance = parse_balance_decimal(&summary.value)?;
 
-    match summary.tag.as_str() {
+    let account_balance = match summary.tag.as_str() {
         AccountSummaryTags::SETTLED_CASH | AccountSummaryTags::TOTAL_CASH_VALUE => {
             // Cash balance - free equals total for settled cash
-            AccountBalance::from_total_and_locked(balance, Decimal::ZERO, currency)
-                .map_err(Into::into)
+            AccountBalance::from_total_and_locked(balance, Decimal::ZERO, currency)?
         }
         AccountSummaryTags::NET_LIQUIDATION => {
             // Net liquidation - represents total equity
             // Free would be calculated from available funds
-            AccountBalance::from_total_and_locked(balance, Decimal::ZERO, currency)
-                .map_err(Into::into)
+            AccountBalance::from_total_and_locked(balance, Decimal::ZERO, currency)?
         }
         AccountSummaryTags::BUYING_POWER | AccountSummaryTags::AVAILABLE_FUNDS => {
             // Available funds - this is the free amount
-            AccountBalance::from_total_and_free(balance, balance, currency).map_err(Into::into)
+            AccountBalance::from_total_and_free(balance, balance, currency)?
         }
         _ => {
             // Default: treat as total balance
-            AccountBalance::from_total_and_locked(balance, Decimal::ZERO, currency)
-                .map_err(Into::into)
+            AccountBalance::from_total_and_locked(balance, Decimal::ZERO, currency)?
         }
-    }
+    };
+    Ok(Some(account_balance))
 }
 
 fn parse_balance_decimal(value: &str) -> anyhow::Result<Decimal> {
@@ -548,7 +588,8 @@ mod tests {
 
     use super::{
         AccountSummaryTags, check_external_position_change, create_position_tracker,
-        merge_account_summary_balance, merge_account_summary_margin, parse_currency,
+        merge_account_summary_balance, merge_account_summary_margin,
+        parse_account_summary_to_balance, parse_currency,
     };
 
     fn margin_summary(tag: &str, value: &str, currency: &str) -> AccountSummary {
@@ -585,6 +626,26 @@ mod tests {
             result.unwrap_err().to_string(),
             "Account summary currency was empty",
         );
+    }
+
+    #[rstest]
+    fn test_parse_account_summary_skips_empty_currency_row() {
+        // Regression (fork issue #5): IBKR's account-summary stream includes at least one
+        // non-monetary row (the `Cushion` ratio) reported with an EMPTY currency. It must be
+        // SKIPPED (`Ok(None)`), not error the parse — otherwise the empty-currency row was the sole
+        // thing seen, zero balances were produced, and the account never entered the cache.
+        let summary = margin_summary(AccountSummaryTags::CUSHION, "0.95", "");
+        let parsed = parse_account_summary_to_balance(&summary).unwrap();
+        assert!(parsed.is_none());
+    }
+
+    #[rstest]
+    fn test_parse_account_summary_parses_monetary_row() {
+        // A monetary row (currency present) still parses to a balance.
+        let summary = margin_summary(AccountSummaryTags::TOTAL_CASH_VALUE, "1000.00", "USD");
+        let balance = parse_account_summary_to_balance(&summary).unwrap().unwrap();
+        assert_eq!(balance.total.currency, Currency::USD());
+        assert_eq!(balance.total.as_decimal(), "1000.00".parse().unwrap());
     }
 
     #[rstest]

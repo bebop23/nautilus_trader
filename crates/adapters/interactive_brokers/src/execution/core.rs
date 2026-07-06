@@ -664,10 +664,15 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         // Wait for initial account summary to load before proceeding
         let client_for_account = Arc::clone(client);
         let account_id = self.core.account_id;
+        let base_currency = self.core.base_currency;
         let _exec_client_core = self.core.clone(); // Clone core to generate account state
         log::debug!("Subscribing to IB account summary for {}", account_id);
-        match crate::execution::account::subscribe_account_summary(&client_for_account, account_id)
-            .await
+        match crate::execution::account::subscribe_account_summary(
+            &client_for_account,
+            account_id,
+            base_currency,
+        )
+        .await
         {
             Ok((balances, margins)) => {
                 tracing::info!(
@@ -1294,7 +1299,11 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             let timeout_dur = Duration::from_secs(request_timeout_secs);
             let result = tokio::time::timeout(
                 timeout_dur,
-                crate::execution::account::subscribe_account_summary(&client_clone, account_id),
+                crate::execution::account::subscribe_account_summary(
+                    &client_clone,
+                    account_id,
+                    base_currency,
+                ),
             )
             .await;
 
