@@ -369,10 +369,17 @@ fn decimal_from_f64(value: f64) -> anyhow::Result<Decimal> {
 /// - "20230223 00:43:36 UTC"
 /// - "20230223 00:43:36" (assumed UTC)
 /// - "20250225-15:15:00" (assumed UTC)
+/// - "20260706 10:24:03 US/Central" (any IANA zone name, resolved DST-correctly via chrono-tz)
+///
+/// IBKR stamps execution reports in the **exchange's** timezone (e.g. CME executions arrive as
+/// `US/Central`), *independent* of the TWS / Gateway session timezone — so non-UTC zones cannot be
+/// configured away and MUST parse. An unrecognized zone token falls back to interpreting the wall
+/// time as UTC with a warning rather than erroring: a zone-shifted event timestamp is recoverable,
+/// while a dropped execution report silently loses the fill (the strategy never observes it).
 ///
 /// # Errors
 ///
-/// Returns an error if the execution timestamp is malformed or uses a non-UTC timezone.
+/// Returns an error if the execution timestamp itself is malformed.
 pub fn parse_execution_time(time_str: &str) -> anyhow::Result<UnixNanos> {
     fn parse_utc(
         time_str: &str,
@@ -410,13 +417,51 @@ pub fn parse_execution_time(time_str: &str) -> anyhow::Result<UnixNanos> {
     }
 
     let timezone = parts[2];
-    if !matches!(timezone, "Universal" | "UTC" | "Etc/UTC" | "GMT" | "Z") {
-        anyhow::bail!(
-            "Unsupported non-UTC execution timezone '{timezone}' in '{time_str}'. Configure TWS / IB Gateway to emit UTC timestamps"
-        );
+    if matches!(timezone, "Universal" | "UTC" | "Etc/UTC" | "GMT" | "Z") {
+        return parse_utc(&date_str, format);
     }
 
+    // IANA zone (IBKR uses the exchange's zone, e.g. "US/Central" for CME): resolve via chrono-tz
+    // (DST-correct).
+    if let Ok(tz) = timezone.parse::<chrono_tz::Tz>() {
+        return parse_in_zone(&date_str, time_str, tz);
+    }
+
+    // Unknown zone token: warn + fall back to UTC rather than dropping the execution report.
+    tracing::warn!(
+        "Unrecognized execution timezone '{timezone}' in '{time_str}'; interpreting wall time as UTC \
+         (event timestamp may be offset by the true zone difference)"
+    );
     parse_utc(&date_str, format)
+}
+
+/// Resolves a wall-clock execution time in an IANA timezone to UTC nanos (DST-correct).
+///
+/// Ambiguous local times (the repeated hour at a DST fall-back) take the EARLIEST mapping;
+/// local times inside a DST spring-forward gap (which a venue clock never emits) fall back to a
+/// UTC interpretation with a warning rather than erroring.
+fn parse_in_zone(date_str: &str, time_str: &str, tz: chrono_tz::Tz) -> anyhow::Result<UnixNanos> {
+    use chrono::{LocalResult, NaiveDateTime, TimeZone};
+
+    let naive = NaiveDateTime::parse_from_str(date_str, "%Y%m%d %H:%M:%S")
+        .map_err(|e| anyhow::anyhow!("Failed to parse execution timestamp '{time_str}': {e}"))?;
+    let resolved = match tz.from_local_datetime(&naive) {
+        LocalResult::Single(dt) => dt,
+        LocalResult::Ambiguous(earliest, _latest) => earliest,
+        LocalResult::None => {
+            tracing::warn!(
+                "Execution timestamp '{time_str}' falls in a DST gap for zone '{tz}'; \
+                 interpreting wall time as UTC"
+            );
+            chrono::Utc.from_utc_datetime(&naive).with_timezone(&tz)
+        }
+    };
+    let nanos: u64 = resolved
+        .timestamp_nanos_opt()
+        .ok_or_else(|| anyhow::anyhow!("Execution timestamp '{time_str}' out of nanosecond range"))?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Execution timestamp '{time_str}' was before Unix epoch"))?;
+    Ok(UnixNanos::new(nanos))
 }
 
 #[cfg(test)]
@@ -459,10 +504,63 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_execution_time_with_unsupported_non_utc_timezone() {
-        let time_str = "20230223 00:43:36 America/New_York";
-        let result = parse_execution_time(time_str);
-        assert!(result.is_err());
+    fn test_parse_execution_time_iana_zone_america_new_york() {
+        // IANA zones must PARSE (IBKR stamps executions in the exchange's zone) — this input was
+        // previously a hard error, which silently dropped the fill report.
+        // 2023-02-23 is EST (UTC-5).
+        let result = parse_execution_time("20230223 00:43:36 America/New_York").unwrap();
+        let expected = parse_execution_time("20230223 05:43:36 UTC").unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[rstest]
+    fn test_parse_execution_time_us_central_live_fill_string() {
+        // The EXACT string from the live 2026-07-06 MNQ paper fill (IB order 353000002, execution
+        // 0000e1a7.6a5c2882.01.01) whose report was dropped pre-fix. July = CDT (UTC-5).
+        let result = parse_execution_time("20260706 10:24:03 US/Central").unwrap();
+        let expected = parse_execution_time("20260706 15:24:03 UTC").unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[rstest]
+    fn test_parse_execution_time_us_eastern() {
+        // July = EDT (UTC-4). Same instant as the US/Central live fill above.
+        let result = parse_execution_time("20260706 11:24:03 US/Eastern").unwrap();
+        let expected = parse_execution_time("20260706 15:24:03 UTC").unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[rstest]
+    fn test_parse_execution_time_dst_offsets_differ_winter_vs_summer() {
+        // DST correctness: the SAME wall time in US/Central maps to different UTC instants in
+        // January (CST, UTC-6) vs July (CDT, UTC-5).
+        let winter = parse_execution_time("20260106 10:00:00 US/Central").unwrap();
+        assert_eq!(
+            winter,
+            parse_execution_time("20260106 16:00:00 UTC").unwrap()
+        );
+        let summer = parse_execution_time("20260706 10:00:00 US/Central").unwrap();
+        assert_eq!(
+            summer,
+            parse_execution_time("20260706 15:00:00 UTC").unwrap()
+        );
+    }
+
+    #[rstest]
+    fn test_parse_execution_time_dst_fallback_ambiguous_takes_earliest() {
+        // US DST fall-back 2026-11-01: 01:30 CT occurs twice; the earliest (CDT, UTC-5) wins.
+        let result = parse_execution_time("20261101 01:30:00 US/Central").unwrap();
+        let expected = parse_execution_time("20261101 06:30:00 UTC").unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[rstest]
+    fn test_parse_execution_time_unknown_zone_falls_back_to_utc() {
+        // An unrecognized zone token must NOT error (a dropped fill is the worst outcome) — it
+        // warns and interprets the wall time as UTC.
+        let result = parse_execution_time("20260706 10:24:03 Mars/Olympus").unwrap();
+        let expected = parse_execution_time("20260706 10:24:03 UTC").unwrap();
+        assert_eq!(result, expected);
     }
 
     #[rstest]
